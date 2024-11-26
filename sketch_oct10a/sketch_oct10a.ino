@@ -21,6 +21,25 @@ int16_t ax_offset = 0, ay_offset = 0, az_offset = 0;
 float vx = 0, vy = 0, vz = 0; // Velocity in m/s
 float x = 0, y = 0, z = 0;     // Position in meters
 
+// Variables for filtered values
+float ax_filtered = 0, ay_filtered = 0, az_filtered = 0;
+float vx_filtered = 0, vy_filtered = 0, vz_filtered = 0;
+
+// Threshold and filtering coefficient
+float threshold = 0.05; // Threshold for ignoring small accelerations (in m/s^2)
+float alpha = 0.9;      // Coefficient for low-pass filter
+float alpha_z = 0.8;    // Specific coefficient for filtering Z axis (more aggressive)
+float friction_x = 0.98;  // Coefficient for reducing velocity drift on X axis
+float friction_y = 0.95;  // Coefficient for reducing velocity drift on Y axis (more aggressive)
+float friction_z = 0.98;  // Coefficient for reducing velocity drift on Z axis
+
+// Variables for filtering history
+#define FILTER_SIZE 10
+float x_history[FILTER_SIZE] = {0};
+float y_history[FILTER_SIZE] = {0};
+float z_history[FILTER_SIZE] = {0};
+int filter_index = 0;
+
 // Function to read Nbytes bytes from I2C device
 void I2Cread(uint8_t Address, uint8_t Register, uint8_t Nbytes, uint8_t* Data)
 {
@@ -66,7 +85,7 @@ void calibrate_accelerometer() {
     // Compute offsets
     ax_offset = ax_sum / samples;
     ay_offset = ay_sum / samples;
-    az_offset = az_sum / samples - 4096; // Compensate for 1G on Z-axis
+    az_offset = az_sum / samples; // Use directly the average measured value
 }
 
 // Initial time
@@ -98,7 +117,7 @@ void setup() {
     calibrate_accelerometer();
     
     // Store initial time
-    ti = millis();
+    ti = micros();
 }
 
 // Counter
@@ -126,33 +145,62 @@ void loop() {
     int16_t ay = -(Buf[2] << 8 | Buf[3]) - ay_offset; // Corrected accelerometer Y
     int16_t az = (Buf[4] << 8 | Buf[5]) - az_offset;  // Corrected accelerometer Z
 
-    // Gyroscope
-    int16_t gx = -(Buf[8] << 8 | Buf[9]); // Corrected gyroscope X
-    int16_t gy = -(Buf[10] << 8 | Buf[11]); // Corrected gyroscope Y
-    int16_t gz = Buf[12] << 8 | Buf[13]; // Corrected gyroscope Z
-
     // Convert raw acceleration to m/s²
     float ax_m_s2 = ax * (4.0 / 32768.0) * 9.81; // Adjust factor based on ±4G setting
     float ay_m_s2 = ay * (4.0 / 32768.0) * 9.81;
     float az_m_s2 = az * (4.0 / 32768.0) * 9.81;
 
-    // Remove gravity component from Z-axis
-    az_m_s2 -= 9.81;  // Remove gravity from Z-axis
+    // Apply threshold to ignore small accelerations
+    if (fabs(ax_m_s2) < threshold) ax_m_s2 = 0;
+    if (fabs(ay_m_s2) < threshold) ay_m_s2 = 0;
+    if (fabs(az_m_s2) < threshold) az_m_s2 = 0;
+
+    // Apply low-pass filter to accelerations
+    ax_filtered = alpha * ax_filtered + (1 - alpha) * ax_m_s2;
+    ay_filtered = alpha * ay_filtered + (1 - alpha) * ay_m_s2;
+    az_filtered = alpha_z * az_filtered + (1 - alpha_z) * az_m_s2;
 
     // Calculate time difference
-    long int currentTime = millis();
-    float dt = (currentTime - ti) / 1000.0; // Convert ms to seconds
+    long int currentTime = micros();
+    float dt = (currentTime - ti) / 1000000.0; // Convert microseconds to seconds
     ti = currentTime; // Update previous time
 
-    // Update velocities by integrating acceleration
-    vx += ax_m_s2 * dt;
-    vy += ay_m_s2 * dt;
-    vz += az_m_s2 * dt;
+    // Update velocities by integrating filtered acceleration
+    vx += ax_filtered * dt;
+    vy += ay_filtered * dt;
+    vz += az_filtered * dt;
 
-    // Update positions by integrating velocity
-    x += vx * dt * 1000; // Convert from m to mm
-    y += vy * dt * 1000; // Convert from m to mm
-    z += vz * dt * 1000; // Convert from m to mm
+    // Apply friction to reduce velocity drift when acceleration is zero
+    if (ax_m_s2 == 0) vx *= friction_x;
+    if (ay_m_s2 == 0) vy *= friction_y;
+    if (az_m_s2 == 0) vz *= friction_z;
+
+    // Apply low-pass filter to velocities
+    vx_filtered = alpha * vx_filtered + (1 - alpha) * vx;
+    vy_filtered = alpha * vy_filtered + (1 - alpha) * vy;
+    vz_filtered = alpha_z * vz_filtered + (1 - alpha_z) * vz;
+
+    // Update history for filtering positions
+    x_history[filter_index] = vx_filtered * dt * 1000;
+    y_history[filter_index] = vy_filtered * dt * 1000;
+    z_history[filter_index] = vz_filtered * dt * 1000;
+    filter_index = (filter_index + 1) % FILTER_SIZE;
+
+    // Calculate average of history
+    float x_avg = 0, y_avg = 0, z_avg = 0;
+    for (int i = 0; i < FILTER_SIZE; i++) {
+        x_avg += x_history[i];
+        y_avg += y_history[i];
+        z_avg += z_history[i];
+    }
+    x_avg /= FILTER_SIZE;
+    y_avg /= FILTER_SIZE;
+    z_avg /= FILTER_SIZE;
+
+    // Update positions using averaged values
+    x += x_avg;
+    y += y_avg;
+    z += z_avg;
 
     // Display accelerometer values
     Serial.print(ax, DEC);
@@ -160,14 +208,6 @@ void loop() {
     Serial.print(ay, DEC);
     Serial.print("\t");
     Serial.print(az, DEC);
-    Serial.print("\t");
-
-    // Display gyroscope values
-    Serial.print(gx, DEC);
-    Serial.print("\t");
-    Serial.print(gy, DEC);
-    Serial.print("\t");
-    Serial.print(gz, DEC);
     Serial.print("\t");
 
     // Display coordinates in mm
